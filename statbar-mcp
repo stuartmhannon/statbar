@@ -1,0 +1,345 @@
+#!/usr/bin/env python3
+"""
+statbar-mcp — Hermes MCP server for StatBar configuration.
+
+Stdio JSON-RPC 2.0 MCP server.
+Configuration file: ~/.config/statbar/config.json
+"""
+
+import json
+import subprocess
+import sys
+from pathlib import Path
+
+# ── Paths ──────────────────────────────────────────────────────────────────
+
+CONFIG_DIR = Path.home() / ".config" / "statbar"
+CONFIG_PATH = CONFIG_DIR / "config.json"
+
+# ── Default Config (mirrors StatBar.swift defaults) ────────────────────────
+
+DEFAULT_CONFIG = {
+    "window": {
+        "x": 0,
+        "y": 30,
+        "width": 250,
+        "max_height": 250,
+        "min_height": 80,
+    },
+    "refresh_interval_secs": 2.0,
+    "appearance": {
+        "background_color": "#141414",
+        "background_opacity": 0.92,
+        "show_shadow": True,
+        "floating_level": True,
+        "movable_by_background": True,
+        "hide_titlebar_buttons": True,
+    },
+    "stats": {
+        "show_cpu": True,
+        "cpu_color": "#007AFF",
+        "show_gpu": True,
+        "gpu_color": "#AF52DE",
+        "show_memory": True,
+        "memory_color": "#30D158",
+        "show_network": True,
+        "network_down_color": "#32ADE6",
+        "network_up_color": "#FF9F0A",
+        "show_disk": True,
+        "disk_color": "#FFD60A",
+        "network_interface_prefixes": ["en", "awdl"],
+        "show_ollama": True,
+        "section_order": ["ollama", "cpu", "gpu", "memory", "network", "disk"]
+    },
+    "ollama": {
+        "enabled": True,
+        "endpoint": "http://localhost:11434/api/ps",
+        "timeout_secs": 2.0,
+    },
+}
+
+# ── Config Operations ──────────────────────────────────────────────────────
+
+
+def read_config() -> dict:
+    """Read config from disk, merging with defaults for any missing keys."""
+    if not CONFIG_PATH.exists():
+        return dict(DEFAULT_CONFIG)
+    try:
+        data = json.loads(CONFIG_PATH.read_text())
+        # Deep merge with defaults so new keys are always present
+        return deep_merge(dict(DEFAULT_CONFIG), data)
+    except (json.JSONDecodeError, OSError):
+        return dict(DEFAULT_CONFIG)
+
+
+def write_config(config: dict) -> None:
+    """Write directly (not atomic) so DispatchSource watchers see the write on the same inode."""
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    CONFIG_PATH.write_text(json.dumps(config, indent=2, sort_keys=True) + "\n")
+
+
+def deep_merge(default: dict, override: dict) -> dict:
+    """Recursively merge override into default (returns new dict)."""
+    result = {}
+    for key, default_val in default.items():
+        if key in override:
+            val = override[key]
+            if isinstance(default_val, dict) and isinstance(val, dict):
+                result[key] = deep_merge(default_val, val)
+            else:
+                result[key] = val
+        else:
+            result[key] = default_val
+    # Include any keys in override not in default
+    for key, val in override.items():
+        if key not in result:
+            result[key] = val
+    return result
+
+
+def update_config(partial: dict) -> dict:
+    """Merge a partial update into the current config and persist."""
+    current = read_config()
+    merged = deep_merge(current, partial)
+    write_config(merged)
+    return merged
+
+
+def is_statbar_running() -> dict:
+    """Check if StatBar process is running."""
+    try:
+        result = subprocess.run(
+            ["ps", "-eo", "pid=,etime=,comm="],
+            capture_output=True, text=True, timeout=5,
+        )
+        for line in result.stdout.strip().splitlines():
+            parts = line.strip().split(None, 2)
+            if len(parts) >= 3 and parts[2] == "statbar":
+                return {"running": True, "pid": int(parts[0]), "uptime": parts[1]}
+    except (subprocess.TimeoutExpired, FileNotFoundError, ValueError):
+        pass
+    return {"running": False, "pid": None, "uptime": None}
+
+
+# ── MCP Protocol (JSON-RPC 2.0 over stdio) ─────────────────────────────────
+
+MCP_VERSION = "2025-03-26"
+SERVER_INFO = {"name": "statbar-mcp", "version": "0.1.4"}
+
+# Tool definitions
+TOOLS = [
+    {
+        "name": "statbar_get_config",
+        "description": "Get the current StatBar configuration as JSON",
+        "inputSchema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "statbar_update_config",
+        "description": "Update StatBar configuration. Provide only the fields you want to change. Changes are written to ~/.config/statbar/config.json and picked up by StatBar within 1 second via its file watcher.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "window": {
+                    "type": "object",
+                    "description": "Window geometry: x, y, width, max_height, min_height",
+                    "properties": {
+                        "x": {"type": "number", "description": "Window X position (screen-left)"},
+                        "y": {"type": "number", "description": "Window Y position (screen-bottom)"},
+                        "width": {"type": "number", "description": "Window width in points"},
+                        "max_height": {"type": "number", "description": "Maximum window height"},
+                        "min_height": {"type": "number", "description": "Minimum window height"},
+                    },
+                },
+                "refresh_interval_secs": {
+                    "type": "number",
+                    "description": "Stats refresh interval in seconds (minimum 0.5)",
+                    "minimum": 0.5,
+                },
+                "appearance": {
+                    "type": "object",
+                    "description": "Visual appearance settings",
+                    "properties": {
+                        "background_color": {
+                            "type": "string",
+                            "description": "Hex background color, e.g. #141414",
+                            "pattern": "^#[0-9A-Fa-f]{6}$",
+                        },
+                        "background_opacity": {
+                            "type": "number",
+                            "description": "Window opacity 0.0-1.0",
+                            "minimum": 0.0,
+                            "maximum": 1.0,
+                        },
+                        "show_shadow": {"type": "boolean"},
+                        "floating_level": {"type": "boolean", "description": "Float above other windows"},
+                        "movable_by_background": {"type": "boolean"},
+                        "hide_titlebar_buttons": {"type": "boolean"},
+                    },
+                },
+                "stats": {
+                    "type": "object",
+                    "description": "Per-stat visibility and colors",
+                    "properties": {
+                        "show_cpu": {"type": "boolean"},
+                        "cpu_color": {"type": "string", "pattern": "^#[0-9A-Fa-f]{6}$"},
+                        "show_gpu": {"type": "boolean"},
+                        "gpu_color": {"type": "string", "pattern": "^#[0-9A-Fa-f]{6}$"},
+                        "show_memory": {"type": "boolean"},
+                        "memory_color": {"type": "string", "pattern": "^#[0-9A-Fa-f]{6}$"},
+                        "show_network": {"type": "boolean"},
+                        "network_down_color": {"type": "string", "pattern": "^#[0-9A-Fa-f]{6}$"},
+                        "network_up_color": {"type": "string", "pattern": "^#[0-9A-Fa-f]{6}$"},
+                        "show_disk": {"type": "boolean"},
+                        "disk_color": {"type": "string", "pattern": "^#[0-9A-Fa-f]{6}$"},
+                        "network_interface_prefixes": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": "Network interface prefixes to monitor (e.g. ['en', 'awdl'])",
+                        },
+                        "show_ollama": {"type": "boolean"},
+                        "section_order": {
+                            "type": "array",
+                            "items": {"type": "string", "enum": ["ollama", "cpu", "gpu", "memory", "network", "disk"]},
+                            "description": "Order of sections in the UI. Valid values: ollama, cpu, gpu, memory, network, disk"
+                        },
+                    },
+                },
+                "ollama": {
+                    "type": "object",
+                    "description": "Ollama integration settings",
+                    "properties": {
+                        "enabled": {"type": "boolean"},
+                        "endpoint": {
+                            "type": "string",
+                            "description": "Ollama API endpoint URL",
+                        },
+                        "timeout_secs": {
+                            "type": "number",
+                            "description": "Ollama request timeout",
+                            "minimum": 0.5,
+                        },
+                    },
+                },
+            },
+        },
+    },
+    {
+        "name": "statbar_reset_config",
+        "description": "Reset StatBar configuration to factory defaults",
+        "inputSchema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "statbar_get_status",
+        "description": "Check if StatBar is running, get PID and uptime",
+        "inputSchema": {"type": "object", "properties": {}},
+    },
+]
+
+def respond(req_id, data):
+    """Wrap data as a JSON-RPC 2.0 tool result response."""
+    return {
+        "jsonrpc": "2.0", "id": req_id,
+        "result": {"content": [{"type": "text", "text": json.dumps(data, indent=2)}]},
+    }
+
+
+def rpc_error(req_id, code, message):
+    """Wrap an error as a JSON-RPC 2.0 error response."""
+    return {"jsonrpc": "2.0", "id": req_id, "error": {"code": code, "message": message}}
+
+
+def handle_request(request: dict) -> dict:
+    """Process a JSON-RPC request and return a response."""
+    method = request.get("method")
+    req_id = request.get("id")
+    params = request.get("params", {})
+
+    if method == "initialize":
+        return {
+            "jsonrpc": "2.0",
+            "id": req_id,
+            "result": {
+                "protocolVersion": MCP_VERSION,
+                "serverInfo": SERVER_INFO,
+                "capabilities": {"tools": {}},
+            },
+        }
+
+    if method == "notifications/initialized":
+        # Notifications have no response per MCP spec
+        return None
+
+    if method == "tools/list":
+        return {"jsonrpc": "2.0", "id": req_id, "result": {"tools": TOOLS}}
+
+    if method == "tools/call":
+        tool_name = params.get("name", "")
+        tool_args = params.get("arguments", {})
+
+        if tool_name == "statbar_get_config":
+            return respond(req_id, read_config())
+
+        elif tool_name == "statbar_update_config":
+            if not tool_args:
+                return rpc_error(req_id, -32602, "No update parameters provided")
+            merged = update_config(tool_args)
+            return respond(req_id, {
+                "status": "updated", "config": merged,
+                "statbar_running": is_statbar_running(),
+            })
+
+        elif tool_name == "statbar_reset_config":
+            write_config(DEFAULT_CONFIG)
+            return respond(req_id, {
+                "status": "reset", "config": DEFAULT_CONFIG,
+                "statbar_running": is_statbar_running(),
+            })
+
+        elif tool_name == "statbar_get_status":
+            status = is_statbar_running()
+            cfg = read_config()
+            status["config_path"] = str(CONFIG_PATH)
+            status["config_summary"] = {
+                "window_position": (cfg["window"]["x"], cfg["window"]["y"]),
+                "window_size": cfg["window"]["width"],
+                "refresh_interval": cfg["refresh_interval_secs"],
+                "visible_stats": [
+                    k for k, v in cfg["stats"].items()
+                    if k.startswith("show_") and v
+                ],
+            }
+            return respond(req_id, status)
+
+        else:
+            return rpc_error(req_id, -32601, f"Unknown tool: {tool_name}")
+
+    return rpc_error(req_id, -32601, f"Unknown method: {method}")
+
+
+def main():
+    """Read JSON-RPC 2.0 requests from stdin, write responses to stdout."""
+    for line in sys.stdin:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            request = json.loads(line)
+        except json.JSONDecodeError as e:
+            response = {
+                "jsonrpc": "2.0",
+                "id": None,
+                "error": {"code": -32700, "message": f"Parse error: {e}"},
+            }
+            sys.stdout.write(json.dumps(response) + "\n")
+            sys.stdout.flush()
+            continue
+
+        response = handle_request(request)
+        if response is not None:
+            sys.stdout.write(json.dumps(response) + "\n")
+            sys.stdout.flush()
+
+
+if __name__ == "__main__":
+    main()

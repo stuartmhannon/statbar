@@ -1,0 +1,11 @@
+# Compiled binary
+statbar
+
+# App bundle (rebuilt from source)
+StatBar.app/
+
+# Python cache
+__pycache__/
+
+# OS files
+.DS_Store
