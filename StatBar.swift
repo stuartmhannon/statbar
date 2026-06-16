@@ -437,7 +437,10 @@ struct ContentView: View {
         if config.stats.show_ollama {
             if models.isEmpty {
                 HStack {
-                    Text("🧠").font(.system(size: 10))
+                    Text("OL")
+                        .font(.system(size: 10, weight: .semibold, design: .monospaced))
+                        .foregroundColor(.white.opacity(0.7))
+                        .frame(width: 16, alignment: .leading)
                     Text("Ollama: idle")
                         .font(.system(size: 10, design: .monospaced))
                         .foregroundColor(.white.opacity(0.4))
@@ -447,7 +450,10 @@ struct ContentView: View {
                 ForEach(models.indices, id: \.self) { i in
                     let m = models[i]
                     HStack(spacing: 4) {
-                        Text("🧠").font(.system(size: 10))
+                        Text("OL")
+                            .font(.system(size: 10, weight: .semibold, design: .monospaced))
+                            .foregroundColor(.white.opacity(0.7))
+                            .frame(width: 16, alignment: .leading)
                         Text(m.name)
                             .font(.system(size: 10, weight: .semibold, design: .monospaced))
                             .foregroundColor(.white).lineLimit(1).truncationMode(.tail)
